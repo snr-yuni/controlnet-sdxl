@@ -1,53 +1,71 @@
+from cog import BasePredictor, Input, Path
 import os
+import cv2
+import time
+import torch
+import shutil
+import numpy as np
+from PIL import Image
+from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline, AutoencoderKL
+from diffusers.utils import load_image
 from typing import List
 
-import torch
-from cog import BasePredictor, Input, Path
-from diffusers import (
-    StableDiffusionPipeline,
-    PNDMScheduler,
-    LMSDiscreteScheduler,
-    DDIMScheduler,
-    EulerDiscreteScheduler,
-    EulerAncestralDiscreteScheduler,
-    DPMSolverMultistepScheduler,
-)
-from diffusers.pipelines.stable_diffusion.safety_checker import (
-    StableDiffusionSafetyChecker,
-)
+CONTROLNET_MODEL_NAME = "diffusers/controlnet-canny-sdxl-1.0"
 
-# MODEL_ID refers to a diffusers-compatible model on HuggingFace
-# e.g. prompthero/openjourney-v2, wavymulder/Analog-Diffusion, etc
-MODEL_ID = "stabilityai/stable-diffusion-2-1"
-MODEL_CACHE = "diffusers-cache"
-SAFETY_MODEL_ID = "CompVis/stable-diffusion-safety-checker"
+# Use the base SDXL model to fine-tune on specific images.
+SDXL_MODEL_NAME = "stabilityai/stable-diffusion-xl-base-1.0"
+
+# Use https://huggingface.co/madebyollin/sdxl-vae-fp16-fix that is modified
+# to run modified to run in fp16 precision without generating NaNs.
+VAE_MODEL_NAME = "madebyollin/sdxl-vae-fp16-fix"
+
+CONTROL_CACHE = "control-cache"
+VAE_CACHE = "vae-cache"
+MODEL_CACHE = "sdxl-cache"
 
 class Predictor(BasePredictor):
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
-        print("Loading pipeline...")
-        safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-            SAFETY_MODEL_ID,
-            cache_dir=MODEL_CACHE,
-            local_files_only=True,
+        print("Initialize ControlNet pipeline.")
+        controlnet = ControlNetModel.from_pretrained(
+            CONTROLNET_MODEL_NAME,
+            torch_dtype=torch.float16
         )
-        self.pipe = StableDiffusionPipeline.from_pretrained(
-            MODEL_ID,
-            safety_checker=safety_checker,
-            cache_dir=MODEL_CACHE,
-            local_files_only=True,
-        ).to("cuda")
+        print("Loading VAE Autoencoder")
+        vae = AutoencoderKL.from_pretrained(
+            VAE_MODEL_NAME,
+            torch_dtype=torch.float16
+        )
+        print("Loading SDXL")
+        pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+            SDXL_MODEL_NAME,
+            vae=vae,
+            controlnet=controlnet,
+            use_safetensors=True,
+            variant="fp16",
+            torch_dtype=torch.float16,
+        )
+        self.pipe = pipe.to("cuda")
+        print("Predictor setup complete.")
+
+    def load_image(self, path):
+        shutil.copyfile(path, "/tmp/image.png")
+        return load_image("/tmp/image.png").convert("RGB")
 
     @torch.inference_mode()
     def predict(
         self,
+        image: Path = Input(
+            description="Input image to create in different art medium",
+            default=None,
+        ),
         prompt: str = Input(
-            description="Input prompt",
-            default="a photo of an astronaut riding a horse on mars",
+            description="Input your imagination",
+            default="line art",
         ),
         negative_prompt: str = Input(
             description="Specify things to not see in the output",
-            default=None,
+            default="poorly drawn hands, poorly drawn feet, poorly drawn face, out of frame, extra limbs, disfigured, deformed, body out of frame, bad anatomy, signature, cut off, low contrast, underexposed, overexposed, bad art, beginner, amateur, distorted face, blurry, draft, grainy",
         ),
         width: int = Input(
             description="Width of output image. Maximum size is 1024x768 or 768x1024 because of memory limits",
@@ -66,50 +84,58 @@ class Predictor(BasePredictor):
             default=1,
         ),
         num_inference_steps: int = Input(
-            description="Number of denoising steps", ge=1, le=500, default=50
+            description="Number of denoising steps",
+            ge=1,
+            le=500,
+             default=50,
         ),
-        guidance_scale: float = Input(
-            description="Scale for classifier-free guidance", ge=1, le=20, default=7.5
+        condition_scale: float = Input(
+            description="controlnet conditioning scale for generalization",
+            default=0.5,
+            ge=0.0,
+            le=1.0,
         ),
-        scheduler: str = Input(
-            default="DPMSolverMultistep",
+        art_medium: str = Input(
+            default="line art",
             choices=[
-                "DDIM",
-                "K_EULER",
-                "DPMSolverMultistep",
-                "K_EULER_ANCESTRAL",
-                "PNDM",
-                "KLMS",
+                "acrylic paint"
+                "caricature",
+                "cartoon"
+                "cinematic",
+                "drawing",
+                "graphite"
+                "illustration",
+                "painting",
             ],
-            description="Choose a scheduler.",
+            description="Choose an art medium.",
         ),
         seed: int = Input(
-            description="Random seed. Leave blank to randomize the seed", default=None
+            description="Random seed. Set to 0 to randomize the seed", default=0
         ),
     ) -> List[Path]:
-        """Run a single prediction on the model"""
-        if seed is None:
+        if (seed is None) or (seed <= 0):
             seed = int.from_bytes(os.urandom(2), "big")
+        generator = torch.Generator("cuda").manual_seed(seed)
         print(f"Using seed: {seed}")
 
-        if width * height > 786432:
-            raise ValueError(
-                "Maximum size is 1024x768 or 768x1024 pixels, because of memory limits. Please select a lower width or height."
-            )
+        image = self.load_image(image)
+        image_width, image_height = image.size
 
-        self.pipe.scheduler = make_scheduler(scheduler, self.pipe.scheduler.config)
+        image = np.array(image)
+        image = cv2.Canny(image, 100, 200)
+        image = image[:, :, None]
+        image = np.concatenate([image, image, image], axis=2)
+        image = Image.fromarray(image)
 
-        generator = torch.Generator("cuda").manual_seed(seed)
-        output = self.pipe(
-            prompt=[prompt] * num_outputs if prompt is not None else None,
+        images = self.pipe(
+            prompt=[art_medium + prompt] * num_outputs if prompt is not None else None,
             negative_prompt=[negative_prompt] * num_outputs
             if negative_prompt is not None
             else None,
-            width=width,
-            height=height,
-            guidance_scale=guidance_scale,
-            generator=generator,
+            image=image, 
+            controlnet_conditioning_scale=condition_scale,
             num_inference_steps=num_inference_steps,
+            generator=generator
         )
 
         output_paths = []
@@ -126,15 +152,7 @@ class Predictor(BasePredictor):
                 f"NSFW content detected. Try running it again, or try a different prompt."
             )
 
+        print("Prediction complete")
         return output_paths
 
 
-def make_scheduler(name, config):
-    return {
-        "PNDM": PNDMScheduler.from_config(config),
-        "KLMS": LMSDiscreteScheduler.from_config(config),
-        "DDIM": DDIMScheduler.from_config(config),
-        "K_EULER": EulerDiscreteScheduler.from_config(config),
-        "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler.from_config(config),
-        "DPMSolverMultistep": DPMSolverMultistepScheduler.from_config(config),
-    }[name]

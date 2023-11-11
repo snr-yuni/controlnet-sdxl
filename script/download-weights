@@ -1,28 +1,40 @@
 #!/usr/bin/env python
 
+# Run this before you deploy it on replicate
 import os
-import shutil
 import sys
-
-from diffusers import StableDiffusionPipeline
-from diffusers.pipelines.stable_diffusion.safety_checker import \
-    StableDiffusionSafetyChecker
+import torch
+from diffusers import ControlNetModel, DiffusionPipeline, AutoencoderKL
 
 # append project directory to path so predict.py can be imported
 sys.path.append('.')
+from predict import CONTROLNET_MODEL_NAME, VAE_MODEL_NAME, SDXL_MODEL_NAME, CONTROL_CACHE, VAE_CACHE, MODEL_CACHE
 
-from predict import MODEL_CACHE, MODEL_ID, SAFETY_MODEL_ID
+# Make cache folders
+if not os.path.exists(MODEL_CACHE):
+    os.makedirs(MODEL_CACHE)
 
-if os.path.exists(MODEL_CACHE):
-    shutil.rmtree(MODEL_CACHE)
-os.makedirs(MODEL_CACHE, exist_ok=True)
-
-saftey_checker = StableDiffusionSafetyChecker.from_pretrained(
-    SAFETY_MODEL_ID,
-    cache_dir=MODEL_CACHE,
+# SD-XL-Base-1.0 refiner
+controlnet = ControlNetModel.from_pretrained(
+    CONTROLNET_MODEL_NAME,
+    torch_dtype=torch.float16
 )
+controlnet.save_pretrained(CONTROL_CACHE)
 
-pipe = StableDiffusionPipeline.from_pretrained(
-    MODEL_ID,
-    cache_dir=MODEL_CACHE,
+# # Download SDXL-VAE-FP16-Fix
+vae = AutoencoderKL.from_pretrained(
+    VAE_MODEL_NAME,
+    torch_dtype=torch.float16,
 )
+vae.save_pretrained(VAE_CACHE, safe_serialization=True)
+
+# SD-XL-Base-1.0
+pipe = DiffusionPipeline.from_pretrained(
+    SDXL_MODEL_NAME,
+    vae=vae,
+    torch_dtype=torch.float16,
+    use_safetensors=True,
+    variant="fp16",
+)
+pipe.save_pretrained(MODEL_CACHE, safe_serialization=True)
+

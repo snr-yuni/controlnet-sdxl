@@ -16,7 +16,7 @@ CONTROLNET_MODEL_NAME = "diffusers/controlnet-canny-sdxl-1.0"
 SDXL_MODEL_NAME = "stabilityai/stable-diffusion-xl-base-1.0"
 
 # Use https://huggingface.co/madebyollin/sdxl-vae-fp16-fix that is modified
-# to run modified to run in fp16 precision without generating NaNs.
+# to run in fp16 precision without generating NaNs.
 VAE_MODEL_NAME = "madebyollin/sdxl-vae-fp16-fix"
 
 CONTROL_CACHE = "control-cache"
@@ -51,6 +51,25 @@ class Predictor(BasePredictor):
     def load_image(self, path):
         shutil.copyfile(path, "/tmp/image.png")
         return load_image("/tmp/image.png").convert("RGB")
+    
+    def process_image(self, image):
+        image = self.load_image(image)
+        image_width, image_height = image.size
+
+        "Convert the loaded image into NumPy array."
+        image = np.array(image)
+        
+        "Edge detection operation using the Canny edge detection algorithm from the OpenCV"
+        image = cv2.Canny(image, 100, 200)
+
+        "Add extra dimensions to the image"
+        image = image[:, :, None]
+
+        """Converts the image to a 3 channel image used in formatting for color 
+        images and convert the NumPy array back to image."""
+        image = np.concatenate([image, image, image], axis=2)
+        image = Image.fromarray(image)
+        return image
 
     @torch.inference_mode()
     def predict(
@@ -60,8 +79,8 @@ class Predictor(BasePredictor):
             default=None,
         ),
         prompt: str = Input(
-            description="Input your imagination",
-            default="line art",
+            description="Choose art medium to generate in that style. For example: a photo of, a acrylic paint of, an anime drawing of, a caricature of, a cartoon of, a drawing of, a graphitti of, an illustration of, a line art of, an oil painting of, a pencil sketch of",
+            default="",
         ),
         negative_prompt: str = Input(
             description="Specify things to not see in the output",
@@ -78,39 +97,24 @@ class Predictor(BasePredictor):
             default=768,
         ),
         num_outputs: int = Input(
-            description="Number of images to output.",
+            description="Number of images to output. > 2 might generate out-of-memory errors.",
             ge=1,
             le=4,
             default=1,
         ),
+        seed: int = Input(
+            description="Random seed. Set to 0 to randomize the seed. If you need tweaks to a generated image, reuse the same seed number from output logs.", 
+            default=0,
+        ),
         num_inference_steps: int = Input(
-            description="Number of denoising steps",
+            description="Number of denoising steps. More denoising steps usually lead to a higher quality image at the expense of slower inference",
             ge=1,
             le=500,
-             default=50,
+            default=100,
         ),
-        condition_scale: float = Input(
-            description="controlnet conditioning scale for generalization",
-            default=0.5,
-            ge=0.0,
-            le=1.0,
-        ),
-        art_medium: str = Input(
-            default="line art",
-            choices=[
-                "acrylic paint"
-                "caricature",
-                "cartoon"
-                "cinematic",
-                "drawing",
-                "graphite"
-                "illustration",
-                "painting",
-            ],
-            description="Choose an art medium.",
-        ),
-        seed: int = Input(
-            description="Random seed. Set to 0 to randomize the seed", default=0
+        guidance_scale: float = Input(
+            description="A higher guidance scale value generate images closely to the text prompt at the expense of lower image quality. Guidance scale is enabled when guidance_scale > 1.",
+            default=7.5,
         ),
     ) -> List[Path]:
         if (seed is None) or (seed <= 0):
@@ -118,31 +122,27 @@ class Predictor(BasePredictor):
         generator = torch.Generator("cuda").manual_seed(seed)
         print(f"Using seed: {seed}")
 
-        image = self.load_image(image)
-        image_width, image_height = image.size
+        "Process the input image to detect edge using NumPy and OpenCV libraries"
+        image = self.process_image(image)
 
-        image = np.array(image)
-        image = cv2.Canny(image, 100, 200)
-        image = image[:, :, None]
-        image = np.concatenate([image, image, image], axis=2)
-        image = Image.fromarray(image)
+        """The outputs of the ControlNet are multiplied by controlnet_conditioning_scale
+        before they are added to the residual in the original unet."""
+        condition_scale = 0.5
 
-        images = self.pipe(
-            prompt=[art_medium + prompt] * num_outputs if prompt is not None else None,
+        output = self.pipe(
+            prompt=[prompt] * num_outputs if prompt is not None else None,
             negative_prompt=[negative_prompt] * num_outputs
             if negative_prompt is not None
             else None,
             image=image, 
             controlnet_conditioning_scale=condition_scale,
             num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
             generator=generator
         )
 
         output_paths = []
         for i, sample in enumerate(output.images):
-            if output.nsfw_content_detected and output.nsfw_content_detected[i]:
-                continue
-
             output_path = f"/tmp/out-{i}.png"
             sample.save(output_path)
             output_paths.append(Path(output_path))
